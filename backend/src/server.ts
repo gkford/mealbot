@@ -5,6 +5,7 @@ import { Server } from 'socket.io';
 import dotenv from 'dotenv';
 import path from 'path';
 import * as fs from 'fs';
+import { google } from 'googleapis';
 import { QueueService } from './services/queue.service';
 import { EmailPollerService } from './services/email-poller.service';
 
@@ -62,21 +63,48 @@ app.get('/auth/google', (req, res) => {
 
 app.get('/auth/callback', async (req, res) => {
   const { code } = req.query;
-  
+
   if (!code) {
     return res.status(400).send('No authorization code provided');
   }
 
-  res.send(`
-    <html>
-      <body>
-        <h1>Authorization Code Received</h1>
-        <p>Code: ${code}</p>
-        <p>Please exchange this code for a refresh token using the Google OAuth2 API.</p>
-        <p>Add the refresh token to your .env file as GMAIL_REFRESH_TOKEN</p>
-      </body>
-    </html>
-  `);
+  try {
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID,
+      process.env.GMAIL_CLIENT_SECRET,
+      process.env.GMAIL_REDIRECT_URI
+    );
+
+    const { tokens } = await oauth2Client.getToken(code as string);
+
+    res.send(`
+      <html>
+        <body>
+          <h1>✅ Authorization Successful!</h1>
+          <h2>Your Refresh Token:</h2>
+          <pre style="background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto;">${tokens.refresh_token}</pre>
+          <p><strong>Instructions:</strong></p>
+          <ol>
+            <li>Copy the refresh token above</li>
+            <li>Add it to your <code>.env</code> file as <code>GMAIL_REFRESH_TOKEN</code></li>
+            <li>Restart the server</li>
+          </ol>
+          ${tokens.access_token ? `<p><small>Access token also generated (expires in ${tokens.expiry_date ? new Date(tokens.expiry_date).toLocaleString() : 'unknown'})</small></p>` : ''}
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error('Error exchanging code for tokens:', error);
+    res.status(500).send(`
+      <html>
+        <body>
+          <h1>❌ Error</h1>
+          <p>Failed to exchange authorization code for tokens.</p>
+          <pre>${error}</pre>
+        </body>
+      </html>
+    `);
+  }
 });
 
 queueService.on('new-submission', (submission) => {
@@ -109,6 +137,82 @@ io.on('connection', (socket) => {
 
 app.get('/api/submissions', (req, res) => {
   res.json(queueService.getSubmissions());
+});
+
+app.post('/api/test/submit-pizza', async (req, res) => {
+  try {
+    const sampleFilesDir = path.join(__dirname, '../../sample_files');
+
+    // Files to attach
+    const testFiles = [
+      'Pizza Palace Receipt.pdf',
+      'eating_pizza.jpeg'
+    ];
+
+    // Copy files to uploads directory and create attachment objects
+    const attachments = [];
+    for (const filename of testFiles) {
+      const sourcePath = path.join(sampleFilesDir, filename);
+      const destFilename = `test-${Date.now()}-${filename}`;
+      const destPath = path.join(uploadsDir, destFilename);
+
+      // Check if source file exists
+      if (!fs.existsSync(sourcePath)) {
+        return res.status(404).json({
+          error: `Test file not found: ${filename}`,
+          path: sourcePath
+        });
+      }
+
+      // Copy file
+      fs.copyFileSync(sourcePath, destPath);
+
+      // Get file stats
+      const stats = fs.statSync(destPath);
+
+      // Determine mime type
+      const ext = path.extname(filename).toLowerCase();
+      const mimeType = ext === '.pdf' ? 'application/pdf' :
+                      ext === '.jpeg' || ext === '.jpg' ? 'image/jpeg' :
+                      'application/octet-stream';
+
+      attachments.push({
+        filename: filename,
+        mimeType: mimeType,
+        path: destPath,
+        size: stats.size
+      });
+    }
+
+    // Create test submission
+    const submission = queueService.addSubmission({
+      email: 'test@example.com',
+      senderName: 'James (Test User)',
+      subject: 'Pizza Receipt - Test Submission',
+      body: `hey,
+
+the three of us got pizza
+
+Here's our receipt
+
+We are james, maddy and frank`,
+      attachments: attachments
+    });
+
+    console.log('🧪 Test submission created:', submission.id);
+
+    res.json({
+      success: true,
+      message: 'Test email simulated successfully',
+      submission: submission
+    });
+  } catch (error) {
+    console.error('Error creating test submission:', error);
+    res.status(500).json({
+      error: 'Failed to create test submission',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
 });
 
 httpServer.listen(PORT, () => {
